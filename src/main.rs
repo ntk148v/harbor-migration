@@ -226,35 +226,70 @@ impl HarborClient {
     }
 
     async fn list_repositories(&self, project_name: &str) -> Result<Vec<Repository>> {
-        let url = format!(
-            "{}/api/v2.0/projects/{}/repositories",
-            self.config.url, project_name
-        );
-        let response = self.client.get(&url).send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to list repositories: {}", response.status());
+        let mut all_repos = Vec::new();
+        let mut page = 1;
+        let page_size = 100;
+
+        loop {
+            let url = format!(
+                "{}/api/v2.0/projects/{}/repositories?page={}&page_size={}",
+                self.config.url, project_name, page, page_size
+            );
+            let response = self.client.get(&url).send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to list repositories: {}", response.status());
+            }
+
+            let repos: Vec<Repository> = response.json().await?;
+            let is_last_page = repos.len() < page_size;
+            all_repos.extend(repos);
+
+            if is_last_page {
+                break;
+            }
+            page += 1;
         }
-        let repos: Vec<Repository> = response.json().await?;
-        Ok(repos)
+
+        Ok(all_repos)
     }
 
     async fn list_artifacts(&self, repository_name: &str) -> Result<Vec<Artifact>> {
+        // Double encode the repository name: / -> %2F -> %252F
         let encoded_repo = repository_name
             .split('/')
             .skip(1)
             .collect::<Vec<_>>()
-            .join("%2F");
+            .join("/");
+        // Use proper URL encoding that will convert / to %252F
+        let double_encoded = urlencoding::encode(&encoded_repo).to_string();
+
         let project = repository_name.split('/').next().unwrap();
-        let url = format!(
-            "{}/api/v2.0/projects/{}/repositories/{}/artifacts",
-            self.config.url, project, encoded_repo
-        );
-        let response = self.client.get(&url).send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to list artifacts: {}", response.status());
+
+        let mut all_artifacts = Vec::new();
+        let mut page = 1;
+        let page_size = 100;
+
+        loop {
+            let url = format!(
+                "{}/api/v2.0/projects/{}/repositories/{}/artifacts?page={}&page_size={}&with_tag=true",
+                self.config.url, project, double_encoded, page, page_size
+            );
+            let response = self.client.get(&url).send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("Failed to list artifacts: {}", response.status());
+            }
+
+            let artifacts: Vec<Artifact> = response.json().await?;
+            let is_last_page = artifacts.len() < page_size;
+            all_artifacts.extend(artifacts);
+
+            if is_last_page {
+                break;
+            }
+            page += 1;
         }
-        let artifacts: Vec<Artifact> = response.json().await?;
-        Ok(artifacts)
+
+        Ok(all_artifacts)
     }
 }
 
