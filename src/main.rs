@@ -1,0 +1,631 @@
+use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
+use chrono::{DateTime, Utc};
+use clap::Parser;
+use futures::stream::{self, StreamExt};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+#[derive(Parser, Debug)]
+#[command(name = "harbor-migrator")]
+#[command(about = "Migrate Harbor repositories between instances", long_about = None)]
+struct Args {
+    /// Path to config file
+    #[arg(short, long)]
+    config: Option<String>,
+
+    /// Use environment variables for configuration
+    #[arg(long)]
+    env: bool,
+
+    /// Generate example config file
+    #[arg(long)]
+    generate_config: Option<String>,
+
+    /// Dry run mode - show what would be migrated without actually migrating
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Maximum number of concurrent image migrations
+    #[arg(long, default_value = "3")]
+    concurrency: usize,
+
+    /// Path to state file for resume capability
+    #[arg(long, default_value = "migration_state.json")]
+    state_file: String,
+
+    /// Resume from previous migration state
+    #[arg(long)]
+    resume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HarborConfig {
+    url: String,
+    username: String,
+    password: String,
+}
+
+impl HarborConfig {
+    fn new(url: String, username: String, password: String) -> Self {
+        Self {
+            url: url.trim_end_matches('/').to_string(),
+            username,
+            password,
+        }
+    }
+
+    fn basic_auth(&self) -> String {
+        let credentials = format!("{}:{}", self.username, self.password);
+        let encoded = general_purpose::STANDARD.encode(credentials.as_bytes());
+        format!("Basic {}", encoded)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    source: HarborConfig,
+    destination: HarborConfig,
+    projects: Vec<String>,
+}
+
+impl Config {
+    fn from_file(path: &str) -> Result<Self> {
+        let content =
+            fs::read_to_string(path).context(format!("Failed to read config file: {}", path))?;
+        let config: Config =
+            serde_json::from_str(&content).context("Failed to parse config file as JSON")?;
+        Ok(config)
+    }
+
+    fn from_env() -> Result<Self> {
+        let source = HarborConfig::new(
+            std::env::var("SOURCE_HARBOR_URL")?,
+            std::env::var("SOURCE_HARBOR_USERNAME")?,
+            std::env::var("SOURCE_HARBOR_PASSWORD")?,
+        );
+        let destination = HarborConfig::new(
+            std::env::var("DEST_HARBOR_URL")?,
+            std::env::var("DEST_HARBOR_USERNAME")?,
+            std::env::var("DEST_HARBOR_PASSWORD")?,
+        );
+        let projects_str = std::env::var("PROJECTS")?;
+        let projects: Vec<String> = projects_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        Ok(Config {
+            source,
+            destination,
+            projects,
+        })
+    }
+
+    fn example() -> Self {
+        Config {
+            source: HarborConfig::new(
+                "https://harbor-a.example.com".to_string(),
+                "robot$migration".to_string(),
+                "source-password".to_string(),
+            ),
+            destination: HarborConfig::new(
+                "https://harbor-b.example.com".to_string(),
+                "robot$migration".to_string(),
+                "dest-password".to_string(),
+            ),
+            projects: vec!["project1".to_string(), "project2".to_string()],
+        }
+    }
+
+    fn save_example(path: &str) -> Result<()> {
+        let config = Self::example();
+        let json = serde_json::to_string_pretty(&config)?;
+        fs::write(path, json)?;
+        println!("Example configuration written to: {}", path);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageRef {
+    project: String,
+    repository: String,
+    tag: String,
+}
+
+impl ImageRef {
+    fn to_string(&self) -> String {
+        format!("{}:{}:{}", self.project, self.repository, self.tag)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MigrationState {
+    started_at: DateTime<Utc>,
+    last_updated: DateTime<Utc>,
+    completed: HashSet<String>,
+    failed: Vec<(String, String)>, // (image_ref, error_message)
+    total_images: usize,
+}
+
+impl MigrationState {
+    fn new() -> Self {
+        let now = Utc::now();
+        Self {
+            started_at: now,
+            last_updated: now,
+            completed: HashSet::new(),
+            failed: Vec::new(),
+            total_images: 0,
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let state: MigrationState = serde_json::from_str(&content)?;
+        Ok(state)
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    fn mark_completed(&mut self, image_ref: &str) {
+        self.completed.insert(image_ref.to_string());
+        self.last_updated = Utc::now();
+    }
+
+    fn mark_failed(&mut self, image_ref: &str, error: &str) {
+        self.failed.push((image_ref.to_string(), error.to_string()));
+        self.last_updated = Utc::now();
+    }
+
+    fn is_completed(&self, image_ref: &str) -> bool {
+        self.completed.contains(image_ref)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Repository {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Artifact {
+    digest: String,
+    tags: Option<Vec<Tag>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Tag {
+    name: String,
+}
+
+struct HarborClient {
+    client: reqwest::Client,
+    config: HarborConfig,
+}
+
+impl HarborClient {
+    fn new(config: HarborConfig) -> Result<Self> {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(&config.basic_auth())?);
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()?;
+        Ok(Self { client, config })
+    }
+
+    async fn list_repositories(&self, project_name: &str) -> Result<Vec<Repository>> {
+        let url = format!(
+            "{}/api/v2.0/projects/{}/repositories",
+            self.config.url, project_name
+        );
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to list repositories: {}", response.status());
+        }
+        let repos: Vec<Repository> = response.json().await?;
+        Ok(repos)
+    }
+
+    async fn list_artifacts(&self, repository_name: &str) -> Result<Vec<Artifact>> {
+        let encoded_repo = repository_name
+            .split('/')
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("%2F");
+        let project = repository_name.split('/').next().unwrap();
+        let url = format!(
+            "{}/api/v2.0/projects/{}/repositories/{}/artifacts",
+            self.config.url, project, encoded_repo
+        );
+        let response = self.client.get(&url).send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to list artifacts: {}", response.status());
+        }
+        let artifacts: Vec<Artifact> = response.json().await?;
+        Ok(artifacts)
+    }
+}
+
+struct Migrator {
+    source: Arc<HarborClient>,
+    destination: Arc<HarborClient>,
+    state: Arc<tokio::sync::Mutex<MigrationState>>,
+    state_file: String,
+    dry_run: bool,
+    multi_progress: MultiProgress,
+}
+
+impl Migrator {
+    fn new(
+        source_config: HarborConfig,
+        dest_config: HarborConfig,
+        state_file: String,
+        dry_run: bool,
+    ) -> Result<Self> {
+        Ok(Self {
+            source: Arc::new(HarborClient::new(source_config)?),
+            destination: Arc::new(HarborClient::new(dest_config)?),
+            state: Arc::new(tokio::sync::Mutex::new(MigrationState::new())),
+            state_file,
+            dry_run,
+            multi_progress: MultiProgress::new(),
+        })
+    }
+
+    fn load_state(&self) -> Result<()> {
+        let path = Path::new(&self.state_file);
+        if path.exists() {
+            let loaded_state = MigrationState::load(path)?;
+            let mut state = futures::executor::block_on(self.state.lock());
+            *state = loaded_state;
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn save_state(&self) -> Result<()> {
+        let state = self.state.lock().await;
+        state.save(Path::new(&self.state_file))
+    }
+
+    async fn collect_all_images(&self, project_names: &[String]) -> Result<Vec<ImageRef>> {
+        let pb = self.multi_progress.add(ProgressBar::new_spinner());
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.green} {msg}")
+                .unwrap(),
+        );
+        pb.set_message("Discovering images...");
+
+        let mut all_images = Vec::new();
+
+        for project_name in project_names {
+            pb.set_message(format!("Scanning project: {}", project_name));
+            let repositories = self.source.list_repositories(project_name).await?;
+
+            for repo in repositories {
+                pb.set_message(format!("Scanning repository: {}", repo.name));
+                let artifacts = self.source.list_artifacts(&repo.name).await?;
+
+                for artifact in artifacts {
+                    if let Some(tags) = artifact.tags {
+                        for tag in tags {
+                            all_images.push(ImageRef {
+                                project: project_name.clone(),
+                                repository: repo.name.clone(),
+                                tag: tag.name,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        pb.finish_with_message(format!("Found {} images", all_images.len()));
+        Ok(all_images)
+    }
+
+    async fn migrate_image(&self, image: ImageRef, pb: ProgressBar) -> Result<()> {
+        let image_ref = image.to_string();
+
+        // Check if already completed
+        {
+            let state = self.state.lock().await;
+            if state.is_completed(&image_ref) {
+                pb.set_message(format!("⏭️  Skipped (already completed): {}", image_ref));
+                pb.inc(1);
+                return Ok(());
+            }
+        }
+
+        pb.set_message(format!("🔄 Migrating: {}:{}", image.repository, image.tag));
+
+        if self.dry_run {
+            pb.set_message(format!(
+                "✓ [DRY RUN] Would migrate: {}:{}",
+                image.repository, image.tag
+            ));
+            pb.inc(1);
+            return Ok(());
+        }
+
+        let source_image = format!(
+            "{}/{}:{}",
+            self.source
+                .config
+                .url
+                .replace("https://", "")
+                .replace("http://", ""),
+            image.repository,
+            image.tag
+        );
+
+        let dest_image = format!(
+            "{}/{}:{}",
+            self.destination
+                .config
+                .url
+                .replace("https://", "")
+                .replace("http://", ""),
+            image.repository,
+            image.tag
+        );
+
+        // Login to source
+        let login_src = tokio::process::Command::new("docker")
+            .args(&[
+                "login",
+                &self
+                    .source
+                    .config
+                    .url
+                    .replace("https://", "")
+                    .replace("http://", ""),
+                "-u",
+                &self.source.config.username,
+                "--password-stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        if let Some(mut stdin) = login_src.stdin {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(self.source.config.password.as_bytes())
+                .await?;
+        }
+
+        // Pull image
+        let pull = tokio::process::Command::new("docker")
+            .args(&["pull", &source_image])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await?;
+
+        if !pull.success() {
+            anyhow::bail!("Failed to pull image");
+        }
+
+        // Tag for destination
+        tokio::process::Command::new("docker")
+            .args(&["tag", &source_image, &dest_image])
+            .status()
+            .await?;
+
+        // Login to destination
+        let login_dst = tokio::process::Command::new("docker")
+            .args(&[
+                "login",
+                &self
+                    .destination
+                    .config
+                    .url
+                    .replace("https://", "")
+                    .replace("http://", ""),
+                "-u",
+                &self.destination.config.username,
+                "--password-stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        if let Some(mut stdin) = login_dst.stdin {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(self.destination.config.password.as_bytes())
+                .await?;
+        }
+
+        // Push image
+        let push = tokio::process::Command::new("docker")
+            .args(&["push", &dest_image])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await?;
+
+        if !push.success() {
+            anyhow::bail!("Failed to push image");
+        }
+
+        // Clean up
+        tokio::process::Command::new("docker")
+            .args(&["rmi", &source_image, &dest_image])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await?;
+
+        {
+            let mut state = self.state.lock().await;
+            state.mark_completed(&image_ref);
+        }
+        self.save_state().await?;
+
+        pb.set_message(format!("✓ Completed: {}:{}", image.repository, image.tag));
+        pb.inc(1);
+
+        Ok(())
+    }
+
+    async fn migrate_projects(&self, project_names: &[String], concurrency: usize) -> Result<()> {
+        // Collect all images
+        let all_images = self.collect_all_images(project_names).await?;
+
+        if all_images.is_empty() {
+            println!("No images found to migrate.");
+            return Ok(());
+        }
+
+        {
+            let mut state = self.state.lock().await;
+            state.total_images = all_images.len();
+        }
+
+        // Create progress bar
+        let pb = self
+            .multi_progress
+            .add(ProgressBar::new(all_images.len() as u64));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        // Create semaphore for concurrency control
+        let semaphore = Arc::new(Semaphore::new(concurrency));
+
+        // Migrate images concurrently
+        let results: Vec<_> = stream::iter(all_images)
+            .map(|image| {
+                let pb = pb.clone();
+                let semaphore = semaphore.clone();
+                let self_clone = self.clone_for_task();
+                async move {
+                    let _permit = semaphore.acquire().await.unwrap();
+                    let result = self_clone.migrate_image(image.clone(), pb).await;
+                    (image, result)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        pb.finish_with_message("Migration complete");
+
+        // Handle errors
+        let mut errors = Vec::new();
+        for (image, result) in results {
+            if let Err(e) = result {
+                errors.push((image.to_string(), e.to_string()));
+                let mut state = self.state.lock().await;
+                state.mark_failed(&image.to_string(), &e.to_string());
+            }
+        }
+
+        self.save_state().await?;
+
+        // Print summary
+        let state = self.state.lock().await;
+        println!("\n=== Migration Summary ===");
+        println!("Total images: {}", state.total_images);
+        println!("Completed: {}", state.completed.len());
+        println!("Failed: {}", state.failed.len());
+
+        if !state.failed.is_empty() {
+            println!("\nFailed migrations:");
+            for (img, err) in &state.failed {
+                println!("  ❌ {}: {}", img, err);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn clone_for_task(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            destination: Arc::clone(&self.destination),
+            state: Arc::clone(&self.state),
+            state_file: self.state_file.clone(),
+            dry_run: self.dry_run,
+            multi_progress: self.multi_progress.clone(),
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Handle generate-config
+    if let Some(path) = args.generate_config {
+        Config::save_example(&path)?;
+        return Ok(());
+    }
+
+    // Load config
+    let config = if let Some(config_path) = args.config {
+        Config::from_file(&config_path)?
+    } else if args.env {
+        Config::from_env()?
+    } else {
+        anyhow::bail!("Must provide --config <path> or --env");
+    };
+
+    println!("🚀 Harbor Migration Tool");
+    println!("Source: {}", config.source.url);
+    println!("Destination: {}", config.destination.url);
+    println!("Projects: {:?}", config.projects);
+    println!("Concurrency: {}", args.concurrency);
+    if args.dry_run {
+        println!("⚠️  DRY RUN MODE - No actual migration will occur");
+    }
+    if args.resume {
+        println!("📂 Resume mode enabled");
+    }
+    println!();
+
+    let migrator = Migrator::new(
+        config.source,
+        config.destination,
+        args.state_file,
+        args.dry_run,
+    )?;
+
+    if args.resume {
+        migrator.load_state()?;
+        let state = migrator.state.lock().await;
+        println!(
+            "Loaded previous state: {} images already completed",
+            state.completed.len()
+        );
+    }
+
+    migrator
+        .migrate_projects(&config.projects, args.concurrency)
+        .await?;
+
+    println!("\n✨ All done!");
+
+    Ok(())
+}

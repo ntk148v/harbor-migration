@@ -1,0 +1,17 @@
+{
+  "source": {
+    "url": "https://harbor-a.example.com",
+    "username": "robot$migration",
+    "password": "source-password"
+  },
+  "destination": {
+    "url": "https://harbor-b.example.com",
+    "username": "robot$migration",
+    "password": "dest-password"
+  },
+  "projects": [
+    "project1",
+    "project2",
+    "project3"
+  ]
+}
