@@ -259,10 +259,7 @@ impl HarborClient {
             .split('/')
             .skip(1)
             .collect::<Vec<_>>()
-            .join("/");
-        // Use proper URL encoding that will convert / to %252F
-        let double_encoded = urlencoding::encode(&encoded_repo).to_string();
-
+            .join("%252F");
         let project = repository_name.split('/').next().unwrap();
 
         let mut all_artifacts = Vec::new();
@@ -272,7 +269,7 @@ impl HarborClient {
         loop {
             let url = format!(
                 "{}/api/v2.0/projects/{}/repositories/{}/artifacts?page={}&page_size={}&with_tag=true",
-                self.config.url, project, double_encoded, page, page_size
+                self.config.url, project, encoded_repo, page, page_size
             );
             let response = self.client.get(&url).send().await?;
             if !response.status().is_success() {
@@ -585,6 +582,7 @@ impl Migrator {
         println!("Total images: {}", state.total_images);
         println!("Completed: {}", state.completed.len());
         println!("Failed: {}", state.failed.len());
+        println!("\n");
 
         if !state.failed.is_empty() {
             println!("\nFailed migrations:");
