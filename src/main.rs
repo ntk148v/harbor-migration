@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
 #[derive(Parser, Debug)]
@@ -267,6 +268,8 @@ struct Migrator {
     state_file: String,
     dry_run: bool,
     multi_progress: MultiProgress,
+    // number of images processed since start (successful or failed)
+    processed_counter: Arc<AtomicUsize>,
 }
 
 impl Migrator {
@@ -283,6 +286,7 @@ impl Migrator {
             state_file,
             dry_run,
             multi_progress: MultiProgress::new(),
+            processed_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -316,14 +320,36 @@ impl Migrator {
 
         for project in projects {
             pb.set_message(format!("Scanning project: {}", project.source));
+            // list repositories first
             let repositories = self.source.list_repositories(&project.source).await?;
 
-            for repo in repositories {
+            // fetch artifacts for repositories concurrently to speed up discovery
+            let src = Arc::clone(&self.source);
+            let project_clone = project.clone();
+            let repo_results = stream::iter(repositories)
+                .map(|repo| {
+                    let src = Arc::clone(&src);
+                    let project_clone = project_clone.clone();
+                    async move {
+                        let artifacts = src.list_artifacts(&project_clone.source, &repo.name).await;
+                        (repo, artifacts)
+                    }
+                })
+                // bound concurrency for discovery
+                .buffer_unordered(8)
+                .collect::<Vec<_>>()
+                .await;
+
+            for (repo, artifacts_res) in repo_results {
                 pb.set_message(format!("Scanning repository: {}", repo.name));
-                let artifacts = self
-                    .source
-                    .list_artifacts(&project.source, &repo.name)
-                    .await?;
+                let artifacts = match artifacts_res {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // record error and continue
+                        eprintln!("Warning: failed to list artifacts for {}: {}", repo.name, e);
+                        continue;
+                    }
+                };
 
                 for artifact in artifacts {
                     if let Some(tags) = artifact.tags {
@@ -344,6 +370,32 @@ impl Migrator {
 
         pb.finish_with_message(format!("Found {} images", all_images.len()));
         Ok(all_images)
+    }
+
+    /// Extract registry host (strip scheme) like "harbor.example.com"
+    fn registry_host(url: &str) -> String {
+        url.replace("https://", "").replace("http://", "").trim_end_matches('/').to_string()
+    }
+
+    async fn docker_login_once(&self, cfg: &HarborConfig) -> Result<()> {
+        let host = Self::registry_host(&cfg.url);
+        let mut child = tokio::process::Command::new("docker")
+            .args(&["login", &host, "-u", &cfg.username, "--password-stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(cfg.password.as_bytes()).await?;
+        }
+
+        let status = child.wait().await?;
+        if !status.success() {
+            anyhow::bail!("docker login failed for {}", host);
+        }
+        Ok(())
     }
 
     async fn migrate_image(&self, image: ImageRef, pb: ProgressBar) -> Result<()> {
@@ -392,32 +444,6 @@ impl Migrator {
             image.tag
         );
 
-        // Login to source
-        let login_src = tokio::process::Command::new("docker")
-            .args(&[
-                "login",
-                &self
-                    .source
-                    .config
-                    .url
-                    .replace("https://", "")
-                    .replace("http://", ""),
-                "-u",
-                &self.source.config.username,
-                "--password-stdin",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        if let Some(mut stdin) = login_src.stdin {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(self.source.config.password.as_bytes())
-                .await?;
-        }
-
         // Pull image
         let pull = tokio::process::Command::new("docker")
             .args(&["pull", &source_image])
@@ -438,32 +464,6 @@ impl Migrator {
             .args(&["tag", &source_image, &dest_image])
             .status()
             .await?;
-
-        // Login to destination
-        let login_dst = tokio::process::Command::new("docker")
-            .args(&[
-                "login",
-                &self
-                    .destination
-                    .config
-                    .url
-                    .replace("https://", "")
-                    .replace("http://", ""),
-                "-u",
-                &self.destination.config.username,
-                "--password-stdin",
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        if let Some(mut stdin) = login_dst.stdin {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(self.destination.config.password.as_bytes())
-                .await?;
-        }
 
         // Push image
         let push = tokio::process::Command::new("docker")
@@ -492,7 +492,11 @@ impl Migrator {
             let mut state = self.state.lock().await;
             state.mark_completed(&image_ref);
         }
-        self.save_state().await?;
+        // batch state saves every 10 images to reduce IO
+        let processed = self.processed_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if processed % 10 == 0 {
+            self.save_state().await?;
+        }
 
         pb.set_message(format!("✓ Completed: {}:{}", image.repository, image.tag));
         pb.inc(1);
@@ -512,6 +516,15 @@ impl Migrator {
         {
             let mut state = self.state.lock().await;
             state.total_images = all_images.len();
+        }
+
+        // Perform docker login once for source and destination registries to avoid
+        // repeating logins for every image which slows down concurrency.
+        if !self.dry_run {
+            // login to source
+            self.docker_login_once(&self.source.config).await?;
+            // login to destination
+            self.docker_login_once(&self.destination.config).await?;
         }
 
         // Create progress bar
@@ -587,6 +600,7 @@ impl Migrator {
             state_file: self.state_file.clone(),
             dry_run: self.dry_run,
             multi_progress: self.multi_progress.clone(),
+            processed_counter: Arc::clone(&self.processed_counter),
         }
     }
 }
