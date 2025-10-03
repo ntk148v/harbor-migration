@@ -200,7 +200,13 @@ impl HarborClient {
                 anyhow::bail!("Failed to list repositories: {}", response.status());
             }
 
-            let repos: Vec<Repository> = response.json().await?;
+            let mut repos: Vec<Repository> = response.json().await?;
+            // remove the project part
+            repos.iter_mut().for_each(|r| {
+                if let Some((_, rest)) = r.name.split_once('/') {
+                    r.name = rest.to_string();
+                }
+            });
             let is_last_page = repos.len() < page_size;
             all_repos.extend(repos);
 
@@ -213,14 +219,13 @@ impl HarborClient {
         Ok(all_repos)
     }
 
-    async fn list_artifacts(&self, repository_name: &str) -> Result<Vec<Artifact>> {
+    async fn list_artifacts(
+        &self,
+        project_name: &str,
+        repository_name: &str,
+    ) -> Result<Vec<Artifact>> {
         // Double encode the repository name: / -> %2F -> %252F
-        let encoded_repo = repository_name
-            .split('/')
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("%252F");
-        let project = repository_name.split('/').next().unwrap();
+        let encoded_repo = repository_name.split('/').collect::<Vec<_>>().join("%252F");
 
         let mut all_artifacts = Vec::new();
         let mut page = 1;
@@ -229,7 +234,7 @@ impl HarborClient {
         loop {
             let url = format!(
                 "{}/api/v2.0/projects/{}/repositories/{}/artifacts?page={}&page_size={}&with_tag=true",
-                self.config.url, project, encoded_repo, page, page_size
+                self.config.url, project_name, encoded_repo, page, page_size
             );
             let response = self.client.get(&url).send().await?;
             if !response.status().is_success() {
@@ -310,7 +315,10 @@ impl Migrator {
 
             for repo in repositories {
                 pb.set_message(format!("Scanning repository: {}", repo.name));
-                let artifacts = self.source.list_artifacts(&repo.name).await?;
+                let artifacts = self
+                    .source
+                    .list_artifacts(&project.source, &repo.name)
+                    .await?;
 
                 for artifact in artifacts {
                     if let Some(tags) = artifact.tags {
@@ -364,7 +372,7 @@ impl Migrator {
                 .url
                 .replace("https://", "")
                 .replace("http://", ""),
-            image.repository,
+            format!("{}/{}", image.project.source, image.repository),
             image.tag
         );
 
@@ -375,9 +383,7 @@ impl Migrator {
                 .url
                 .replace("https://", "")
                 .replace("http://", ""),
-            image
-                .repository
-                .replace(&image.project.source, &image.project.destination),
+            format!("{}/{}", image.project.destination, image.repository),
             image.tag
         );
 
