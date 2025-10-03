@@ -372,31 +372,7 @@ impl Migrator {
         Ok(all_images)
     }
 
-    /// Extract registry host (strip scheme) like "harbor.example.com"
-    fn registry_host(url: &str) -> String {
-        url.replace("https://", "").replace("http://", "").trim_end_matches('/').to_string()
-    }
-
-    async fn docker_login_once(&self, cfg: &HarborConfig) -> Result<()> {
-        let host = Self::registry_host(&cfg.url);
-        let mut child = tokio::process::Command::new("docker")
-            .args(&["login", &host, "-u", &cfg.username, "--password-stdin"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(cfg.password.as_bytes()).await?;
-        }
-
-        let status = child.wait().await?;
-        if !status.success() {
-            anyhow::bail!("docker login failed for {}", host);
-        }
-        Ok(())
-    }
+    // skopeo will be used to copy images directly between registries.
 
     async fn migrate_image(&self, image: ImageRef, pb: ProgressBar) -> Result<()> {
         let image_ref = image.to_string();
@@ -444,49 +420,35 @@ impl Migrator {
             image.tag
         );
 
-        // Pull image
-        let pull = tokio::process::Command::new("docker")
-            .args(&["pull", &source_image])
+        // Use skopeo to copy directly between registries (no local pull/push)
+        // Source/destination image strings are registry/namespace/repo:tag
+        // skopeo expects docker://<registry>/<path>:tag
+        let src_creds = format!("{}:{}", self.source.config.username, self.source.config.password);
+        let dst_creds = format!("{}:{}", self.destination.config.username, self.destination.config.password);
+
+        let skopeo_args = [
+            "copy",
+            "--src-creds",
+            &src_creds,
+            "--dest-creds",
+            &dst_creds,
+            &format!("docker://{}", source_image),
+            &format!("docker://{}", dest_image),
+        ];
+
+        let skopeo_out = tokio::process::Command::new("skopeo")
+            .args(&skopeo_args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .output()
             .await?;
 
-        if !pull.status.success() {
+        if !skopeo_out.status.success() {
             anyhow::bail!(
-                "Failed to pull image: {}",
-                String::from_utf8_lossy(&pull.stderr)
+                "Failed to skopeo copy image: {}",
+                String::from_utf8_lossy(&skopeo_out.stderr)
             );
         }
-
-        // Tag for destination
-        tokio::process::Command::new("docker")
-            .args(&["tag", &source_image, &dest_image])
-            .status()
-            .await?;
-
-        // Push image
-        let push = tokio::process::Command::new("docker")
-            .args(&["push", &dest_image])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .await?;
-
-        if !push.status.success() {
-            anyhow::bail!(
-                "Failed to push image: {}",
-                String::from_utf8_lossy(&push.stderr)
-            );
-        }
-
-        // Clean up
-        tokio::process::Command::new("docker")
-            .args(&["rmi", &source_image, &dest_image])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await?;
 
         {
             let mut state = self.state.lock().await;
@@ -518,14 +480,7 @@ impl Migrator {
             state.total_images = all_images.len();
         }
 
-        // Perform docker login once for source and destination registries to avoid
-        // repeating logins for every image which slows down concurrency.
-        if !self.dry_run {
-            // login to source
-            self.docker_login_once(&self.source.config).await?;
-            // login to destination
-            self.docker_login_once(&self.destination.config).await?;
-        }
+        // Using skopeo for transfers; no per-image docker login required.
 
         // Create progress bar
         let pb = self
