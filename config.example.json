@@ -10,8 +10,13 @@
     "password": "dest-password"
   },
   "projects": [
-    "project1",
-    "project2",
-    "project3"
+    {
+      "source": "project1",
+      "destination": "project1-migrated"
+    },
+    {
+      "source": "project2",
+      "destination": "project2"
+    }
   ]
 }

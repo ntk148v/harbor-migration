@@ -68,11 +68,17 @@ impl HarborConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectConfig {
+    source: String,
+    destination: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
     source: HarborConfig,
     destination: HarborConfig,
-    projects: Vec<String>,
+    projects: Vec<ProjectConfig>,
 }
 
 impl Config {
@@ -83,66 +89,21 @@ impl Config {
             serde_json::from_str(&content).context("Failed to parse config file as JSON")?;
         Ok(config)
     }
-
-    fn from_env() -> Result<Self> {
-        let source = HarborConfig::new(
-            std::env::var("SOURCE_HARBOR_URL")?,
-            std::env::var("SOURCE_HARBOR_USERNAME")?,
-            std::env::var("SOURCE_HARBOR_PASSWORD")?,
-        );
-        let destination = HarborConfig::new(
-            std::env::var("DEST_HARBOR_URL")?,
-            std::env::var("DEST_HARBOR_USERNAME")?,
-            std::env::var("DEST_HARBOR_PASSWORD")?,
-        );
-        let projects_str = std::env::var("PROJECTS")?;
-        let projects: Vec<String> = projects_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Ok(Config {
-            source,
-            destination,
-            projects,
-        })
-    }
-
-    fn example() -> Self {
-        Config {
-            source: HarborConfig::new(
-                "https://harbor-a.example.com".to_string(),
-                "robot$migration".to_string(),
-                "source-password".to_string(),
-            ),
-            destination: HarborConfig::new(
-                "https://harbor-b.example.com".to_string(),
-                "robot$migration".to_string(),
-                "dest-password".to_string(),
-            ),
-            projects: vec!["project1".to_string(), "project2".to_string()],
-        }
-    }
-
-    fn save_example(path: &str) -> Result<()> {
-        let config = Self::example();
-        let json = serde_json::to_string_pretty(&config)?;
-        fs::write(path, json)?;
-        println!("Example configuration written to: {}", path);
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageRef {
-    project: String,
+    project: ProjectConfig,
     repository: String,
     tag: String,
 }
 
 impl ImageRef {
     fn to_string(&self) -> String {
-        format!("{}:{}:{}", self.project, self.repository, self.tag)
+        format!(
+            "{}(source)->{}(destination):{}:{}",
+            self.project.source, self.project.destination, self.repository, self.tag
+        )
     }
 }
 
@@ -201,7 +162,6 @@ struct Repository {
 
 #[derive(Debug, Deserialize)]
 struct Artifact {
-    digest: String,
     tags: Option<Vec<Tag>>,
 }
 
@@ -333,7 +293,7 @@ impl Migrator {
         state.save(Path::new(&self.state_file))
     }
 
-    async fn collect_all_images(&self, project_names: &[String]) -> Result<Vec<ImageRef>> {
+    async fn collect_all_images(&self, projects: &[ProjectConfig]) -> Result<Vec<ImageRef>> {
         let pb = self.multi_progress.add(ProgressBar::new_spinner());
         pb.set_style(
             ProgressStyle::default_spinner()
@@ -344,9 +304,9 @@ impl Migrator {
 
         let mut all_images = Vec::new();
 
-        for project_name in project_names {
-            pb.set_message(format!("Scanning project: {}", project_name));
-            let repositories = self.source.list_repositories(project_name).await?;
+        for project in projects {
+            pb.set_message(format!("Scanning project: {}", project.source));
+            let repositories = self.source.list_repositories(&project.source).await?;
 
             for repo in repositories {
                 pb.set_message(format!("Scanning repository: {}", repo.name));
@@ -356,7 +316,10 @@ impl Migrator {
                     if let Some(tags) = artifact.tags {
                         for tag in tags {
                             all_images.push(ImageRef {
-                                project: project_name.clone(),
+                                project: ProjectConfig {
+                                    source: project.source.clone(),
+                                    destination: project.destination.clone(),
+                                },
                                 repository: repo.name.clone(),
                                 tag: tag.name,
                             });
@@ -412,7 +375,9 @@ impl Migrator {
                 .url
                 .replace("https://", "")
                 .replace("http://", ""),
-            image.repository,
+            image
+                .repository
+                .replace(&image.project.source, &image.project.destination),
             image.tag
         );
 
@@ -518,9 +483,9 @@ impl Migrator {
         Ok(())
     }
 
-    async fn migrate_projects(&self, project_names: &[String], concurrency: usize) -> Result<()> {
+    async fn migrate_projects(&self, projects: &[ProjectConfig], concurrency: usize) -> Result<()> {
         // Collect all images
-        let all_images = self.collect_all_images(project_names).await?;
+        let all_images = self.collect_all_images(projects).await?;
 
         if all_images.is_empty() {
             println!("No images found to migrate.");
@@ -610,19 +575,11 @@ impl Migrator {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Handle generate-config
-    if let Some(path) = args.generate_config {
-        Config::save_example(&path)?;
-        return Ok(());
-    }
-
     // Load config
     let config = if let Some(config_path) = args.config {
         Config::from_file(&config_path)?
-    } else if args.env {
-        Config::from_env()?
     } else {
-        anyhow::bail!("Must provide --config <path> or --env");
+        anyhow::bail!("Must provide --config <path>");
     };
 
     println!("🚀 Harbor Migration Tool");
