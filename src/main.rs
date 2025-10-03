@@ -101,8 +101,13 @@ struct ImageRef {
 impl ImageRef {
     fn to_string(&self) -> String {
         format!(
-            "{}(source)->{}(destination):{}:{}",
-            self.project.source, self.project.destination, self.repository, self.tag
+            "(source){}/{}:{}->(destination){}/{}:{}",
+            self.project.source,
+            self.repository,
+            self.tag,
+            self.project.destination,
+            self.repository,
+            self.tag
         )
     }
 }
@@ -417,12 +422,15 @@ impl Migrator {
         let pull = tokio::process::Command::new("docker")
             .args(&["pull", &source_image])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .output()
             .await?;
 
-        if !pull.success() {
-            anyhow::bail!("Failed to pull image");
+        if !pull.status.success() {
+            anyhow::bail!(
+                "Failed to pull image: {}",
+                String::from_utf8_lossy(&pull.stderr)
+            );
         }
 
         // Tag for destination
@@ -461,12 +469,15 @@ impl Migrator {
         let push = tokio::process::Command::new("docker")
             .args(&["push", &dest_image])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .output()
             .await?;
 
-        if !push.success() {
-            anyhow::bail!("Failed to push image");
+        if !push.status.success() {
+            anyhow::bail!(
+                "Failed to push image: {}",
+                String::from_utf8_lossy(&push.stderr)
+            );
         }
 
         // Clean up
@@ -549,10 +560,13 @@ impl Migrator {
 
         // Print summary
         let state = self.state.lock().await;
-        println!("\n=== Migration Summary ===");
+        println!("\n=========================");
+        println!("\n=   Migration Summary   =");
+        println!("\n=========================");
         println!("Total images: {}", state.total_images);
         println!("Completed: {}", state.completed.len());
         println!("Failed: {}", state.failed.len());
+        println!("\n=========================");
         println!("\n");
 
         if !state.failed.is_empty() {
