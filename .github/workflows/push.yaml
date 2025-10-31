@@ -1,46 +1,51 @@
-name: Multi-platform Build
+name: Cross-Platform Rust Build
 
 on: [push, pull_request]
 
 jobs:
   build:
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        # Define target artifact name based on OS for consistency
-        include:
-          - os: ubuntu-latest
-            artifact_name: harbor-migration-linux-x86_64
-          - os: windows-latest
-            artifact_name: harbor-migration-windows-x86_64.exe
-          - os: macos-latest
-            artifact_name: harbor-migration-macos-x86_64
+        # Define the target platforms to build for
+        target:
+          - x86_64-unknown-linux-musl # Statically linked Linux binary
+          - x86_64-pc-windows-gnu # Windows binary
+          # Note: macOS builds typically require a macos-latest runner
+          # - x86_64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
+          # Install the necessary target-specific toolchains first
+          targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release
+      - name: Install 'cross' for easy cross-compilation
+        uses: taiki-e/install-action@cross
 
-      - name: Rename binary for artifact upload
-        shell: bash # Use bash on all platforms for consistent scripting
+      - name: Build for target ${{ matrix.target }}
+        # Use the 'cross' command instead of 'cargo'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact name
+        id: artifact_name
         run: |
-          # Use a shell script to find and rename the built binary correctly
-          APP_NAME="harbor-migration" # Replace with your project's binary name
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            find target/release/ -maxdepth 1 -name "*.exe" -exec mv {} target/release/${{ matrix.artifact_name }} \;
-          else
-            find target/release/ -maxdepth 1 -type f ! -name "*.d" ! -name "*.rlib" -exec mv {} target/release/${{ matrix.artifact_name }} \;
+          APP_NAME="harbor-migration" # Explicitly define the app name
+          EXTENSION=""
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            EXTENSION=".exe"
           fi
+          echo "name=$APP_NAME-$EXTENSION" >> $GITHUB_OUTPUT
+          echo "path=target/${{ matrix.target }}/release/$APP_NAME$EXTENSION" >> $GITHUB_OUTPUT
 
-      - name: Upload artifact
+      - name: Upload artifact for ${{ matrix.target }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: target/release/${{ matrix.artifact_name }}
+          # The artifact name will be something like 'harbor-migration-.exe-x86_64-pc-windows-gnu'
+          name: ${{ steps.artifact_name.outputs.name }}-${{ matrix.target }}
+          path: ${{ steps.artifact_name.outputs.path }}
